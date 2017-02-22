@@ -1,4 +1,4 @@
-/* Copyright (c) 2012-2016, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2012, 2014, The Linux Foundation. All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions are
@@ -30,12 +30,17 @@
 #ifndef __MM_QCAMERA_APP_H__
 #define __MM_QCAMERA_APP_H__
 
-// System dependencies
 #include <pthread.h>
-#include <linux/msm_ion.h>
+#include <errno.h>
+#include <sys/ioctl.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <poll.h>
+#include <linux/fb.h>
 #include <linux/msm_mdp.h>
+#include <semaphore.h>
 
-// Camera dependencies
 #include "mm_camera_interface.h"
 #include "mm_jpeg_interface.h"
 #include "mm_qcamera_socket.h"
@@ -45,7 +50,6 @@
 #define MM_APP_MAX_DUMP_FRAME_NUM 1000
 
 #define PREVIEW_BUF_NUM 7
-#define SNAPSHOT_BUF_NUM 10
 #define VIDEO_BUF_NUM 7
 #define ISP_PIX_BUF_NUM 9
 #define STATS_BUF_NUM 4
@@ -53,18 +57,18 @@
 #define CAPTURE_BUF_NUM 5
 
 #define DEFAULT_PREVIEW_FORMAT    CAM_FORMAT_YUV_420_NV21
-#define DEFAULT_PREVIEW_WIDTH     1280
-#define DEFAULT_PREVIEW_HEIGHT    960
+#define DEFAULT_PREVIEW_WIDTH     640
+#define DEFAULT_PREVIEW_HEIGHT    480
 #define DEFAULT_PREVIEW_PADDING   CAM_PAD_TO_WORD
 #define DEFAULT_VIDEO_FORMAT      CAM_FORMAT_YUV_420_NV12
 #define DEFAULT_VIDEO_WIDTH       800
 #define DEFAULT_VIDEO_HEIGHT      480
 #define DEFAULT_VIDEO_PADDING     CAM_PAD_TO_2K
 #define DEFAULT_SNAPSHOT_FORMAT   CAM_FORMAT_YUV_420_NV21
-#define DEFAULT_RAW_FORMAT        CAM_FORMAT_BAYER_MIPI_RAW_10BPP_GBRG
+#define DEFAULT_RAW_FORMAT        CAM_FORMAT_BAYER_QCOM_RAW_10BPP_GBRG
 
-#define DEFAULT_SNAPSHOT_WIDTH    4160
-#define DEFAULT_SNAPSHOT_HEIGHT   3120
+#define DEFAULT_SNAPSHOT_WIDTH    1024
+#define DEFAULT_SNAPSHOT_HEIGHT   768
 #define DEFAULT_SNAPSHOT_PADDING  CAM_PAD_TO_WORD
 
 #define DEFAULT_OV_FORMAT         MDP_Y_CRCB_H2V2
@@ -107,9 +111,7 @@ typedef enum {
     TUNE_PREVCMD_DEINIT,
 } mm_camera_tune_prevcmd_t;
 
-typedef void (*cam_stream_user_cb) (mm_camera_buf_def_t *frame);
 typedef void (*prev_callback) (mm_camera_buf_def_t *preview_frame);
-
 
 typedef struct {
   char *send_buf;
@@ -159,8 +161,8 @@ typedef struct {
     int                     fd;
     int                     main_ion_fd;
     ion_user_handle_t       handle;
-    size_t                  size;
-    parm_buffer_t          *data;
+    uint32_t                size;
+    void *                  data;
 } mm_camera_app_meminfo_t;
 
 typedef struct {
@@ -230,9 +232,8 @@ typedef struct {
     int encodeJpeg;
     int zsl_enabled;
     int8_t focus_supported;
-    cam_stream_user_cb user_preview_cb;
-    cam_stream_user_cb user_metadata_cb;
-    parm_buffer_t *params_buffer;
+    prev_callback user_preview_cb;
+    parm_buffer_new_t *params_buffer;
     USER_INPUT_DISPLAY_T preview_resolution;
 
     //Reprocess params&stream
@@ -242,8 +243,9 @@ typedef struct {
     int8_t enable_CAC;
     mm_camera_queue_t pp_frames;
     mm_camera_stream_t *reproc_stream;
-    metadata_buffer_t *metadata;
+    cam_metadata_info_t *metadata;
     int8_t is_chromatix_reload;
+    tune_chromatix_t tune_data;
 } mm_camera_test_obj_t;
 
 typedef struct {
@@ -251,10 +253,8 @@ typedef struct {
   void* ptr_jpeg;
 
   uint8_t (*get_num_of_cameras) ();
-  int32_t (*mm_camera_open) (uint8_t camera_idx, mm_camera_vtbl_t **camera_vtbl);
-  uint32_t (*jpeg_open)(mm_jpeg_ops_t *ops, mm_jpeg_mpo_ops_t *mpo_ops,
-                   mm_dimension picture_size,
-                   cam_jpeg_metadata_t *jpeg_metadata);
+  mm_camera_vtbl_t *(*mm_camera_open) (uint8_t camera_idx);
+  uint32_t (*jpeg_open) (mm_jpeg_ops_t *ops, mm_dimension picture_size);
 
 } hal_interface_lib_t;
 
@@ -348,18 +348,15 @@ typedef struct {
 
 extern int mm_app_unit_test_entry(mm_camera_app_t *cam_app);
 extern int mm_app_dual_test_entry(mm_camera_app_t *cam_app);
-extern int setmetainfoCommand(mm_camera_test_obj_t *test_obj,
-                              cam_stream_size_info_t *value);
-
 extern void mm_app_dump_frame(mm_camera_buf_def_t *frame,
                               char *name,
                               char *ext,
-                              uint32_t frame_idx);
+                              int frame_idx);
 extern void mm_app_dump_jpeg_frame(const void * data,
-                                   size_t size,
+                                   uint32_t size,
                                    char* name,
                                    char* ext,
-                                   uint32_t index);
+                                   int index);
 extern int mm_camera_app_timedwait(uint8_t seconds);
 extern int mm_camera_app_wait();
 extern void mm_camera_app_done();
@@ -378,11 +375,12 @@ extern int mm_app_stream_initbuf(cam_frame_len_offset_t *frame_offset_info,
                                  void *user_data);
 extern int32_t mm_app_stream_deinitbuf(mm_camera_map_unmap_ops_tbl_t *ops_tbl,
                                        void *user_data);
-extern int mm_app_cache_ops(mm_camera_app_meminfo_t *mem_info, int cmd);
-extern int32_t mm_app_stream_clean_invalidate_buf(uint32_t index, void *user_data);
-extern int32_t mm_app_stream_invalidate_buf(uint32_t index, void *user_data);
+extern int mm_app_cache_ops(mm_camera_app_meminfo_t *mem_info,
+                            unsigned int cmd);
+extern int32_t mm_app_stream_clean_invalidate_buf(int index, void *user_data);
+extern int32_t mm_app_stream_invalidate_buf(int index, void *user_data);
 extern int mm_app_open(mm_camera_app_t *cam_app,
-                       int cam_id,
+                       uint8_t cam_id,
                        mm_camera_test_obj_t *test_obj);
 extern int mm_app_close(mm_camera_test_obj_t *test_obj);
 extern mm_camera_channel_t * mm_app_add_channel(
@@ -447,8 +445,7 @@ extern int mm_app_stop_live_snapshot(mm_camera_test_obj_t *test_obj);
 extern int mm_app_start_capture(mm_camera_test_obj_t *test_obj,
                                 uint8_t num_snapshots);
 extern int mm_app_stop_capture(mm_camera_test_obj_t *test_obj);
-extern int mm_app_start_capture_raw(mm_camera_test_obj_t *test_obj,
-                                    uint8_t num_snapshots);
+extern int mm_app_start_capture_raw(mm_camera_test_obj_t *test_obj, uint8_t num_snapshots);
 extern int mm_app_stop_capture_raw(mm_camera_test_obj_t *test_obj);
 extern int mm_app_start_rdi(mm_camera_test_obj_t *test_obj, uint8_t num_burst);
 extern int mm_app_stop_rdi(mm_camera_test_obj_t *test_obj);
@@ -456,22 +453,11 @@ extern int mm_app_initialize_fb(mm_camera_test_obj_t *test_obj);
 extern int mm_app_close_fb(mm_camera_test_obj_t *test_obj);
 extern int mm_app_fb_write(mm_camera_test_obj_t *test_obj, char *buffer);
 extern int mm_app_overlay_display(mm_camera_test_obj_t *test_obj, int bufferFd);
-extern int mm_app_allocate_ion_memory(mm_camera_app_buf_t *buf, unsigned int ion_type);
+extern int mm_app_allocate_ion_memory(mm_camera_app_buf_t *buf, int ion_type);
 extern int mm_app_deallocate_ion_memory(mm_camera_app_buf_t *buf);
-extern int mm_app_set_params(mm_camera_test_obj_t *test_obj,
+int mm_app_set_params(mm_camera_test_obj_t *test_obj,
                       cam_intf_parm_type_t param_type,
                       int32_t value);
-extern int mm_app_set_preview_fps_range(mm_camera_test_obj_t *test_obj,
-                        cam_fps_range_t *fpsRange);
-extern int mm_app_set_face_detection(mm_camera_test_obj_t *test_obj,
-                        cam_fd_set_parm_t *fd_set_parm);
-extern int mm_app_set_metadata_usercb(mm_camera_test_obj_t *test_obj,
-                      cam_stream_user_cb usercb);
-extern int mm_app_set_face_detection(mm_camera_test_obj_t *test_obj,
-        cam_fd_set_parm_t *fd_set_parm);
-extern int mm_app_set_flash_mode(mm_camera_test_obj_t *test_obj,
-        cam_flash_mode_t flashMode);
-
 /* JIG camera lib interface */
 
 int mm_camera_lib_open(mm_camera_lib_handle *handle, int cam_id);
@@ -487,7 +473,7 @@ int mm_camera_lib_close(mm_camera_lib_handle *handle);
 int32_t mm_camera_load_tuninglibrary(
   mm_camera_tuning_lib_params_t *tuning_param);
 int mm_camera_lib_set_preview_usercb(
-  mm_camera_lib_handle *handle, cam_stream_user_cb cb);
+  mm_camera_lib_handle *handle, prev_callback cb);
 //
 
 int mm_app_start_regression_test(int run_tc);
@@ -506,7 +492,7 @@ extern int mm_app_start_reprocess(mm_camera_test_obj_t *test_obj);
 extern int mm_app_stop_reprocess(mm_camera_test_obj_t *test_obj);
 extern int mm_app_do_reprocess(mm_camera_test_obj_t *test_obj,
         mm_camera_buf_def_t *frame,
-        uint32_t meta_idx,
+        uint8_t meta_idx,
         mm_camera_super_buf_t *super_buf,
         mm_camera_stream_t *src_meta);
 extern void mm_app_release_ppinput(void *data, void *user_data);
